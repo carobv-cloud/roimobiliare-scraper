@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RoImobiliare OLX -> GHL - v3 fix email + website"""
+"""RoImobiliare OLX -> GHL cu custom fields: Titlu Anunt, Pret Vanzare Cerut, Link Publicat"""
 
 import os, re, sys, time, logging
 import requests
@@ -11,6 +11,11 @@ log = logging.getLogger(__name__)
 GHL_API_KEY  = os.environ['GHL_API_KEY']
 APIFY_TOKEN  = os.environ.get('APIFY_TOKEN', '')
 GHL_LOCATION = 'AojtIWqW6PK1qoRK1zLm'
+
+# Custom field keys create de tine in GHL
+CF_TITLU = 'contact.titlu_anunt'
+CF_PRET  = 'contact.pret_vanzare_cerut'
+CF_LINK  = 'contact.link_publicare'
 
 HEADERS_GHL = {
     'Authorization': f'Bearer {GHL_API_KEY}',
@@ -25,33 +30,35 @@ def get_proxies():
     return {'http': proxy, 'https': proxy}
 
 def extract_olx_id(href):
-    """Extrage ID-ul numeric/alfanumeric din URL OLX.
-    Ex: .../anunt-IDkjNTh.html -> IDkjNTh
-        .../anunt-ID123abc.html -> ID123abc
-    """
     m = re.search(r'-(ID[A-Za-z0-9]+)\.html', href)
     if m:
         return m.group(1)
-    # fallback: ultimul segment fara .html
     return href.rstrip('/').split('/')[-1].replace('.html', '')
 
 def create_ghl_contact(listing):
-    lid = listing['id']
-    price_str = listing['price_str']
-    href = listing['url']
-    title = listing['title']
+    lid      = listing['id']
+    title    = listing['title']
+    price    = listing['price_str']
+    href     = listing['url']
 
-    # Email placeholder unic si curat - fara caractere speciale
-    fake_email = f"olx-{lid}@leads.roimobiliare.ro"
+    # Email unic si curat bazat pe ID
+    fake_email = f'olx-{lid}@leads.roimobiliare.ro'
 
     payload = {
         'locationId': GHL_LOCATION,
-        'firstName': title[:50],
-        'lastName': f'[OLX] {price_str}',
+        # Campuri standard - lăsăm firstName/lastName goale
+        # ca sa fie completate manual cand obtii datele vanzatorului
+        'firstName': '',
+        'lastName': '',
         'email': fake_email,
-        'website': href,
         'source': 'OLX Scraper',
         'tags': ['scraper', 'olx', 'sibiu', 'de-sunat'],
+        # Custom fields cu datele anuntului
+        'customFields': [
+            {'key': CF_TITLU, 'field_value': title},
+            {'key': CF_PRET,  'field_value': price},
+            {'key': CF_LINK,  'field_value': href},
+        ],
     }
 
     r = requests.post(
@@ -61,10 +68,10 @@ def create_ghl_contact(listing):
 
     if r.status_code in (200, 201):
         cid = r.json().get('contact', {}).get('id', '?')
-        log.info(f'OK GHL id={cid} | {title[:35]} | {price_str}')
+        log.info(f'OK id={cid} | {title[:40]} | {price}')
         return True
     elif r.status_code == 422:
-        log.info(f'SKIP (exista deja): {lid}')
+        log.info(f'SKIP (exista): {lid}')
         return False
     else:
         log.error(f'GHL ERROR {r.status_code}: {r.text[:300]}')
@@ -90,63 +97,45 @@ def scrape_olx():
         for page in range(1, 6):
             url = f'https://www.olx.ro/imobiliare/{slug}/sibiu/?page={page}'
             log.info(f'Scraping: {url}')
-
             try:
                 r = requests.get(url, headers=headers, proxies=proxies,
                                  timeout=30, verify=False if proxies else True)
                 r.raise_for_status()
             except Exception as e:
-                log.error(f'GET failed: {e}')
-                break
+                log.error(f'GET failed: {e}'); break
 
             soup = BeautifulSoup(r.text, 'lxml')
             cards = soup.select('[data-cy="l-card"]')
-            log.info(f'  {len(cards)} cards found')
-
-            if not cards:
-                break
+            log.info(f'  {len(cards)} anunturi gasite')
+            if not cards: break
 
             for card in cards:
                 try:
                     a = card.select_one('a[href*="/d/"]')
                     if not a: continue
-
                     href = a['href']
                     if not href.startswith('http'):
                         href = 'https://www.olx.ro' + href
                     href = href.split('?')[0]
 
-                    # ID corect din URL
                     lid = extract_olx_id(href)
-                    if lid in seen:
-                        continue
+                    if lid in seen: continue
                     seen.add(lid)
 
-                    # Titlu
                     title_el = card.select_one('[data-cy="ad-card-title"] h6, h6, h4')
                     title = title_el.get_text(strip=True) if title_el else 'Anunt OLX Sibiu'
 
-                    # Pret
                     price_el = card.select_one('[data-testid="ad-price"]')
                     price_text = price_el.get_text(strip=True) if price_el else ''
-                    nums = re.findall(r'[0-9]+', price_text.replace('.', '').replace(' ', ''))
+                    nums = re.findall(r'[0-9]+', price_text.replace('.','').replace(' ',''))
                     price_val = int(''.join(nums[:2])) if nums else 0
                     cur = 'RON' if 'RON' in price_text.upper() or 'LEI' in price_text.upper() else 'EUR'
                     price_str = f'{price_val:,} {cur}' if price_val else 'Pret negociabil'
 
-                    listing = {
-                        'id': lid,
-                        'title': title,
-                        'url': href,
-                        'price_str': price_str,
-                        'type': ptype,
-                    }
-
-                    if create_ghl_contact(listing):
+                    if create_ghl_contact({'id': lid, 'title': title, 'price_str': price_str, 'url': href}):
                         total_new += 1
 
                     time.sleep(0.3)
-
                 except Exception as e:
                     log.error(f'Card error: {e}')
 
@@ -154,9 +143,7 @@ def scrape_olx():
 
     log.info(f'=== DONE: {total_new} contacte noi in GHL ===')
 
-
 if __name__ == '__main__':
-    import urllib3
-    urllib3.disable_warnings()
-    log.info(f'Apify proxy: {"ON" if APIFY_TOKEN else "OFF"}')
+    import urllib3; urllib3.disable_warnings()
+    log.info(f'Proxy: {"APIFY ON" if APIFY_TOKEN else "OFF"}')
     scrape_olx()
