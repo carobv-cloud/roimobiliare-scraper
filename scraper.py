@@ -65,19 +65,16 @@ def extract_olx_id(href):
     return m.group(1) if m else href.rstrip('/').split('/')[-1].replace('.html', '')
 
 def extract_numeric_id(html_text):
-    """Extrage ad_id numeric din HTML. Structura: ad_id=290870674"""
-    # Metoda 1: ad_id= in query parameters (Google ads)
-    m = re.search(r'ad_id[=%]3D([0-9]{6,12})', html_text)
+    """Extrage ad_id numeric din HTML. Pattern principal: \"sku\":\"290870674\" """
+    # Metoda 1: schema.org sku - cel mai fiabil in server-side HTML
+    m = re.search(r'"sku"\s*:\s*"([0-9]{6,12})"', html_text)
     if m:
         return m.group(1)
+    # Metoda 2: ad_id= in query parameters
     m = re.search(r'ad_id=([0-9]{6,12})', html_text)
     if m:
         return m.group(1)
-    # Metoda 2: "id":290870674 in JSON
-    m = re.search(r'"id"\s*:\s*([0-9]{7,12})\s*[,}]', html_text)
-    if m:
-        return m.group(1)
-    # Metoda 3: /offers/290870674/ in script sau link
+    # Metoda 3: /offers/290870674/
     m = re.search(r'/offers/([0-9]{6,12})/', html_text)
     if m:
         return m.group(1)
