@@ -1,23 +1,321 @@
-name: RoImobiliare Scraper
+#!/usr/bin/env python3
+"""
+RoImobiliare OLX -> GHL
+Scrapeaza OLX Sibiu si creeaza contacte in GoHighLevel cu toate detaliile.
+"""
 
-on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+import os, re, sys, time, logging
+import requests
+from bs4 import BeautifulSoup
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-      - run: pip install -r requirements.txt
-      - name: Run scraper
-        env:
-          GHL_API_KEY: ${{ secrets.GHL_API_KEY }}
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-        run: python scraper.py
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    stream=sys.stdout
+)
+log = logging.getLogger(__name__)
+
+GHL_API_KEY  = os.environ['GHL_API_KEY']
+GHL_LOCATION = 'AojtIWqW6PK1qoRK1zLm'
+GHL_URL      = 'https://services.leadconnectorhq.com'
+
+HEADERS_GHL = {
+    'Authorization': f'Bearer {GHL_API_KEY}',
+    'Content-Type': 'application/json',
+    'Version': '2021-07-28',
+}
+
+# Custom field keys - FARA prefixul "contact."
+CF = {
+    'titlu':           'titlu_anunt',
+    'pret':            'pret_vanzare_cerut',
+    'link':            'link_publicare',
+    'nr_camere':       'nr_camere',
+    'suprafata':       'suprafata',
+    'oras':            'oras',
+    'compartimentare': 'compartimentare',
+    'an_constructie':  'an_constructie',
+    'etaj':            'etaj',
+    'tip_vanzator':    'tip_vanzator',
+    'descriere':       'descriere_anunt',
+    'telefon':         'telefon_vanzator',
+}
+
+HEADERS_SCRAPER = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+    'Accept-Language': 'ro-RO,ro;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
+
+HEADERS_API = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'ro-RO,ro;q=0.9',
+    'Referer': 'https://www.olx.ro/',
+    'Origin': 'https://www.olx.ro',
+}
+
+
+def extract_olx_id(href):
+    """Extrage ID alfanumeric: casa-IDjGsKu.html -> IDjGsKu"""
+    m = re.search(r'-(ID[A-Za-z0-9]+)\.html', href)
+    return m.group(1) if m else href.rstrip('/').split('/')[-1].replace('.html', '')
+
+
+def extract_numeric_id(html_text):
+    """Extrage ad_id numeric din HTML folosind schema.org sku."""
+    # Metoda 1: schema.org sku - cel mai fiabil
+    m = re.search(r'"sku"\s*:\s*"([0-9]{6,12})"', html_text)
+    if m:
+        return m.group(1)
+    # Metoda 2: ad_id= in parametrii
+    m = re.search(r'ad_id=([0-9]{6,12})', html_text)
+    if m:
+        return m.group(1)
+    # Metoda 3: /offers/290870674/
+    m = re.search(r'/offers/([0-9]{6,12})/', html_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def clean_html(text):
+    """Curata tagurile HTML din descriere."""
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def fetch_details(href):
+    """Viziteaza pagina OLX si apeleaza API pentru detalii + telefon."""
+    result = {}
+
+    try:
+        r = requests.get(href, headers=HEADERS_SCRAPER, timeout=25)
+        html = r.text
+
+        # Extrage numeric_id
+        numeric_id = extract_numeric_id(html)
+        log.info(f'  numeric_id: {numeric_id}')
+
+        if not numeric_id:
+            log.warning(f'  Nu am gasit numeric_id pentru {href}')
+            return result
+
+        # === OLX API - detalii complete ===
+        try:
+            api_r = requests.get(
+                f'https://www.olx.ro/api/v1/offers/{numeric_id}/',
+                headers=HEADERS_API,
+                timeout=20
+            )
+            log.info(f'  API detalii status: {api_r.status_code}')
+
+            if api_r.status_code == 200:
+                data = api_r.json().get('data', {})
+
+                # Descriere
+                raw_desc = data.get('description', '')
+                if raw_desc:
+                    result['descriere'] = clean_html(raw_desc)[:2000]
+                    log.info(f'  Descriere: {len(result["descriere"])} chars')
+
+                # Parametri structurati
+                param_mapping = {
+                    'rooms':        'nr_camere',
+                    'm':            'suprafata',
+                    'builttype':    'compartimentare',
+                    'built_year':   'an_constructie',
+                    'floor_select': 'etaj',
+                }
+                for p in data.get('params', []):
+                    key = p.get('key', '')
+                    val = p.get('value', {})
+                    label = val.get('label') or str(val.get('key', ''))
+                    if key in param_mapping and label:
+                        result[param_mapping[key]] = label
+
+                # Oras
+                city = data.get('location', {}).get('city', {}).get('name', '')
+                if city:
+                    result['oras'] = city
+
+                # Tip vanzator
+                is_biz = data.get('user', {}).get('is_business', False)
+                result['tip_vanzator'] = 'Agentie imobiliara' if is_biz else 'Persoana fizica'
+
+                log.info(f'  Params: {[p.get("key") for p in data.get("params", [])]}')
+
+        except Exception as e:
+            log.warning(f'  OLX API detalii error: {e}')
+
+        # === OLX API - telefon ===
+        # Format raspuns: {"data": {"phones": ["073 306 0088"]}}
+        try:
+            ph_r = requests.get(
+                f'https://www.olx.ro/api/v1/offers/{numeric_id}/limited-phones/',
+                headers=HEADERS_API,
+                timeout=20
+            )
+            log.info(f'  Phone API status: {ph_r.status_code}')
+
+            if ph_r.status_code == 200:
+                ph_json = ph_r.json()
+                phones = ph_json.get('data', {}).get('phones', [])
+                if phones:
+                    result['telefon'] = phones[0].replace(' ', '')
+                    log.info(f'  Telefon: {result["telefon"]}')
+                else:
+                    log.info(f'  Phone API OK dar lista goala')
+            else:
+                log.info(f'  Phone API {ph_r.status_code} - fara telefon')
+
+        except Exception as e:
+            log.warning(f'  Phone error: {e}')
+
+    except Exception as e:
+        log.error(f'  fetch_details error: {e}')
+
+    return result
+
+
+def create_ghl_contact(listing):
+    """Creeaza contact in GHL cu toate campurile custom."""
+    lid   = listing['id']
+    title = listing['title']
+    price = listing['price_str']
+
+    cf_list = []
+    for field_key, cf_key in CF.items():
+        val = str(listing.get(field_key, '')).strip()
+        if val:
+            cf_list.append({'key': cf_key, 'field_value': val})
+
+    phone = listing.get('telefon', '').replace(' ', '').replace('-', '')
+
+    payload = {
+        'locationId': GHL_LOCATION,
+        'firstName': title[:50],
+        'lastName': f'[OLX] {price}',
+        'email': f'olx-{lid}@leads.roimobiliare.ro',
+        'source': 'OLX Scraper',
+        'tags': ['scraper', 'olx', 'sibiu', 'de-sunat'],
+        'customFields': cf_list,
+    }
+    if phone:
+        payload['phone'] = phone
+
+    r = requests.post(
+        f'{GHL_URL}/contacts/',
+        headers=HEADERS_GHL,
+        json=payload,
+        timeout=15
+    )
+
+    if r.status_code in (200, 201):
+        cid = r.json().get('contact', {}).get('id', '?')
+        log.info(f'GHL OK {cid} | {title[:35]} | {price} | cf={len(cf_list)} | tel={"DA" if phone else "NU"}')
+        return True
+    elif r.status_code == 422:
+        log.info(f'SKIP exista: {lid}')
+        return False
+    else:
+        log.error(f'GHL ERROR {r.status_code}: {r.text[:200]}')
+        return False
+
+
+def scrape_olx():
+    cats = [
+        ('apartamente-garsoniere-de-vanzare', 'apartament'),
+        ('case-de-vanzare', 'casa'),
+        ('terenuri-de-vanzare', 'teren'),
+    ]
+    seen = set()
+    total_new = 0
+
+    for slug, ptype in cats:
+        for page in range(1, 6):
+            url = f'https://www.olx.ro/imobiliare/{slug}/sibiu/?page={page}'
+            log.info(f'--- {url}')
+
+            try:
+                r = requests.get(url, headers=HEADERS_SCRAPER, timeout=30)
+                r.raise_for_status()
+            except Exception as e:
+                log.error(f'GET failed: {e}')
+                break
+
+            soup = BeautifulSoup(r.text, 'lxml')
+            cards = soup.select('[data-cy="l-card"]')
+            log.info(f'  {len(cards)} anunturi gasite')
+            if not cards:
+                break
+
+            for card in cards:
+                try:
+                    a = card.select_one('a[href*="/d/"]')
+                    if not a:
+                        continue
+                    href = a['href']
+                    if not href.startswith('http'):
+                        href = 'https://www.olx.ro' + href
+                    href = href.split('?')[0]
+
+                    lid = extract_olx_id(href)
+                    if lid in seen:
+                        continue
+                    seen.add(lid)
+
+                    title_el = card.select_one('[data-cy="ad-card-title"] h6, h6, h4')
+                    title = title_el.get_text(strip=True) if title_el else 'Anunt OLX Sibiu'
+
+                    price_el = card.select_one('[data-testid="ad-price"]')
+                    price_text = price_el.get_text(strip=True) if price_el else ''
+                    nums = re.findall(r'[0-9]+', price_text.replace('.', '').replace(' ', ''))
+                    price_val = int(''.join(nums[:2])) if nums else 0
+                    cur = 'RON' if 'RON' in price_text.upper() or 'LEI' in price_text.upper() else 'EUR'
+                    price_str = f'{price_val:,} {cur}' if price_val else 'Pret negociabil'
+
+                    loc_el = card.select_one('[data-testid="location-date"]')
+                    oras = loc_el.get_text(strip=True).split(',')[0].strip() if loc_el else 'Sibiu'
+
+                    log.info(f'  -> {title[:45]} | {price_str}')
+                    time.sleep(0.5)
+
+                    details = fetch_details(href)
+
+                    listing = {
+                        'id': lid,
+                        'title': title,
+                        'price_str': price_str,
+                        'titlu': title,
+                        'pret': price_str,
+                        'link': href,
+                        'oras':            details.get('oras', oras),
+                        'nr_camere':       details.get('nr_camere', ''),
+                        'suprafata':       details.get('suprafata', ''),
+                        'compartimentare': details.get('compartimentare', ''),
+                        'an_constructie':  details.get('an_constructie', ''),
+                        'etaj':            details.get('etaj', ''),
+                        'tip_vanzator':    details.get('tip_vanzator', ''),
+                        'descriere':       details.get('descriere', ''),
+                        'telefon':         details.get('telefon', ''),
+                    }
+
+                    if create_ghl_contact(listing):
+                        total_new += 1
+
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    log.error(f'Card error: {e}')
+
+            time.sleep(2)
+
+    log.info(f'=== DONE: {total_new} contacte noi in GHL ===')
+
+
+if __name__ == '__main__':
+    log.info('Pornire scraper OLX -> GHL')
+    scrape_olx()
