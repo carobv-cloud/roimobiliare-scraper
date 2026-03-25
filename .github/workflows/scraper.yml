@@ -19,4 +19,5 @@ jobs:
       - name: Run scraper
         env:
           GHL_API_KEY: ${{ secrets.GHL_API_KEY }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: python scraper.py
