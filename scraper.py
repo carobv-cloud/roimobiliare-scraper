@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RoImobiliare OLX -> GHL cu custom fields: Titlu Anunt, Pret Vanzare Cerut, Link Publicat"""
+"""RoImobiliare OLX -> GHL v5 - toate campurile custom populate"""
 
 import os, re, sys, time, logging
 import requests
@@ -11,11 +11,7 @@ log = logging.getLogger(__name__)
 GHL_API_KEY  = os.environ['GHL_API_KEY']
 APIFY_TOKEN  = os.environ.get('APIFY_TOKEN', '')
 GHL_LOCATION = 'AojtIWqW6PK1qoRK1zLm'
-
-# Custom field keys create de tine in GHL
-CF_TITLU = 'contact.titlu_anunt'
-CF_PRET  = 'contact.pret_vanzare_cerut'
-CF_LINK  = 'contact.link_publicare'
+GHL_URL      = 'https://services.leadconnectorhq.com'
 
 HEADERS_GHL = {
     'Authorization': f'Bearer {GHL_API_KEY}',
@@ -23,58 +19,108 @@ HEADERS_GHL = {
     'Version': '2021-07-28',
 }
 
+# Custom field keys FARA prefixul "contact." - acesta e formatul corect GHL
+CF = {
+    'titlu':          'titlu_anunt',
+    'pret':           'pret_vanzare_cerut',
+    'link':           'link_publicare',
+    'nr_camere':      'nr_camere',
+    'suprafata':      'suprafata',
+    'oras':           'oras',
+    'compartimentare':'compartimentare',
+    'an_constructie': 'an_constructie',
+    'etaj':           'etaj',
+    'tip_vanzator':   'tip_vanzator',
+}
+
 def get_proxies():
-    if not APIFY_TOKEN:
-        return None
-    proxy = f'http://groups-RESIDENTIAL,country-RO:{APIFY_TOKEN}@proxy.apify.com:8000'
-    return {'http': proxy, 'https': proxy}
+    if not APIFY_TOKEN: return None
+    p = f'http://groups-RESIDENTIAL,country-RO:{APIFY_TOKEN}@proxy.apify.com:8000'
+    return {'http': p, 'https': p}
 
 def extract_olx_id(href):
     m = re.search(r'-(ID[A-Za-z0-9]+)\.html', href)
-    if m:
-        return m.group(1)
-    return href.rstrip('/').split('/')[-1].replace('.html', '')
+    return m.group(1) if m else href.rstrip('/').split('/')[-1].replace('.html','')
+
+def fetch_listing_details(href, proxies, headers):
+    """Viziteaza pagina individuala OLX si extrage toate detaliile."""
+    details = {'link': href}
+    try:
+        r = requests.get(href, headers=headers, proxies=proxies,
+                         timeout=25, verify=False if proxies else True)
+        soup = BeautifulSoup(r.text, 'lxml')
+        body = soup.get_text()
+
+        # Parametri structurati din body text
+        param_map = {
+            'Compartimentare':   'compartimentare',
+            'Compartimentare:':  'compartimentare',
+            'Suprafata utila':   'suprafata',
+            'Suprafata utila:':  'suprafata',
+            'Suprafata:':        'suprafata',
+            'An constructie':    'an_constructie',
+            'An constructie:':   'an_constructie',
+            'Etaj:':             'etaj',
+            'Etaj':              'etaj',
+        }
+
+        for label, field in param_map.items():
+            if field in details: continue
+            idx = body.find(label)
+            if idx > 0:
+                snippet = body[idx + len(label):idx + len(label) + 50].strip()
+                val = snippet.split('\n')[0].strip().rstrip('.')
+                if val: details[field] = val
+
+        # Tip vanzator
+        if 'Persoana fizica' in body:
+            details['tip_vanzator'] = 'Persoana fizica'
+        elif 'Agentie' in body or 'agentie' in body:
+            details['tip_vanzator'] = 'Agentie imobiliara'
+        elif 'Dezvoltator' in body:
+            details['tip_vanzator'] = 'Dezvoltator'
+
+        # Oras din breadcrumb sau location
+        loc = soup.select_one('[data-testid="ad-contact-location"], [class*="location"]')
+        if loc:
+            details['oras'] = loc.get_text(strip=True).split(',')[0].strip()
+
+    except Exception as e:
+        log.warning(f'details fetch failed: {e}')
+    return details
 
 def create_ghl_contact(listing):
-    lid      = listing['id']
-    title    = listing['title']
-    price    = listing['price_str']
-    href     = listing['url']
+    lid   = listing['id']
+    title = listing['title']
+    price = listing['price_str']
 
-    # Email unic si curat bazat pe ID
-    fake_email = f'olx-{lid}@leads.roimobiliare.ro'
+    # Costruieste lista de custom fields - doar cele cu valoare
+    cf_list = []
+    for field_key, cf_key in CF.items():
+        val = listing.get(field_key, '')
+        if val:
+            cf_list.append({'key': cf_key, 'field_value': str(val)})
 
     payload = {
         'locationId': GHL_LOCATION,
-        # Campuri standard - lăsăm firstName/lastName goale
-        # ca sa fie completate manual cand obtii datele vanzatorului
-        'firstName': '',
-        'lastName': '',
-        'email': fake_email,
+        'firstName': title[:50],
+        'lastName': f'[OLX] {price}',
+        'email': f'olx-{lid}@leads.roimobiliare.ro',
         'source': 'OLX Scraper',
         'tags': ['scraper', 'olx', 'sibiu', 'de-sunat'],
-        # Custom fields cu datele anuntului
-        'customFields': [
-            {'key': CF_TITLU, 'field_value': title},
-            {'key': CF_PRET,  'field_value': price},
-            {'key': CF_LINK,  'field_value': href},
-        ],
+        'customFields': cf_list,
     }
 
-    r = requests.post(
-        'https://services.leadconnectorhq.com/contacts/',
-        headers=HEADERS_GHL, json=payload, timeout=15
-    )
-
+    r = requests.post(f'{GHL_URL}/contacts/', headers=HEADERS_GHL, json=payload, timeout=15)
     if r.status_code in (200, 201):
         cid = r.json().get('contact', {}).get('id', '?')
-        log.info(f'OK id={cid} | {title[:40]} | {price}')
+        log.info(f'OK {cid} | {title[:35]} | {price} | cf={len(cf_list)}')
         return True
     elif r.status_code == 422:
-        log.info(f'SKIP (exista): {lid}')
+        log.info(f'SKIP exista: {lid}')
         return False
     else:
-        log.error(f'GHL ERROR {r.status_code}: {r.text[:300]}')
+        log.error(f'GHL {r.status_code}: {r.text[:200]}')
         return False
 
 def scrape_olx():
@@ -83,13 +129,11 @@ def scrape_olx():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'ro-RO,ro;q=0.9',
     }
-
     cats = [
         ('apartamente-garsoniere-de-vanzare', 'apartament'),
         ('case-de-vanzare', 'casa'),
         ('terenuri-de-vanzare', 'teren'),
     ]
-
     seen = set()
     total_new = 0
 
@@ -106,7 +150,7 @@ def scrape_olx():
 
             soup = BeautifulSoup(r.text, 'lxml')
             cards = soup.select('[data-cy="l-card"]')
-            log.info(f'  {len(cards)} anunturi gasite')
+            log.info(f'  {len(cards)} anunturi')
             if not cards: break
 
             for card in cards:
@@ -114,8 +158,7 @@ def scrape_olx():
                     a = card.select_one('a[href*="/d/"]')
                     if not a: continue
                     href = a['href']
-                    if not href.startswith('http'):
-                        href = 'https://www.olx.ro' + href
+                    if not href.startswith('http'): href = 'https://www.olx.ro' + href
                     href = href.split('?')[0]
 
                     lid = extract_olx_id(href)
@@ -132,12 +175,36 @@ def scrape_olx():
                     cur = 'RON' if 'RON' in price_text.upper() or 'LEI' in price_text.upper() else 'EUR'
                     price_str = f'{price_val:,} {cur}' if price_val else 'Pret negociabil'
 
-                    if create_ghl_contact({'id': lid, 'title': title, 'price_str': price_str, 'url': href}):
+                    loc_el = card.select_one('[data-testid="location-date"]')
+                    oras = (loc_el.get_text(strip=True).split(',')[0].strip()
+                            if loc_el else 'Sibiu')
+
+                    # Fetch detalii din pagina individuala
+                    time.sleep(0.5)
+                    details = fetch_listing_details(href, proxies, headers)
+
+                    listing = {
+                        'id': lid,
+                        'title': title,
+                        'price_str': price_str,
+                        'titlu': title,
+                        'pret': price_str,
+                        'link': href,
+                        'oras': details.get('oras', oras),
+                        'nr_camere': details.get('nr_camere', ''),
+                        'suprafata': details.get('suprafata', ''),
+                        'compartimentare': details.get('compartimentare', ''),
+                        'an_constructie': details.get('an_constructie', ''),
+                        'etaj': details.get('etaj', ''),
+                        'tip_vanzator': details.get('tip_vanzator', ''),
+                    }
+
+                    if create_ghl_contact(listing):
                         total_new += 1
 
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                 except Exception as e:
-                    log.error(f'Card error: {e}')
+                    log.error(f'Card: {e}')
 
             time.sleep(2)
 
@@ -145,5 +212,5 @@ def scrape_olx():
 
 if __name__ == '__main__':
     import urllib3; urllib3.disable_warnings()
-    log.info(f'Proxy: {"APIFY ON" if APIFY_TOKEN else "OFF"}')
+    log.info(f'Proxy: {"APIFY" if APIFY_TOKEN else "OFF"}')
     scrape_olx()
