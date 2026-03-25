@@ -4,16 +4,11 @@ on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      source:
-        description: 'Source (olx/publi24/imobiliare/storia/imoradar24/all)'
-        required: false
-        default: 'all'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,13 +18,5 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run scraper
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scraper.py --source ${{ github.event.inputs.source || 'all' }}
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraper-logs-${{ github.run_id }}
-          path: '*.log'
-          retention-days: 7
+          GHL_API_KEY: ${{ secrets.GHL_API_KEY }}
+        run: python scraper.py
