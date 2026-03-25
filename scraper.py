@@ -55,10 +55,7 @@ HEADERS_API = {
 }
 
 def get_proxies():
-    if not APIFY_TOKEN:
-        return None
-    p = f'http://groups-RESIDENTIAL,country-RO:{APIFY_TOKEN}@proxy.apify.com:8000'
-    return {'http': p, 'https': p}
+    return None
 
 def extract_olx_id(href):
     m = re.search(r'-(ID[A-Za-z0-9]+)\.html', href)
