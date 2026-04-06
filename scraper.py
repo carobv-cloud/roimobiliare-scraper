@@ -1,486 +1,319 @@
 """
-RoImobiliare.com â Scraper v3
-ArhitecturÄ: Supabase (toate datele) â GHL (doar anunÈuri cu telefon)
+RoImobiliare.com â Scraper v4
+URLs verificate live pe 2026-04-06:
+  - imobiliare.ro: /vanzare-case-vile/judetul-sibiu/{localitate}
+  - storia.ro:     /ro/rezultate/vanzare/casa/sibiu/{localitate}
+  - olx.ro:        /imobiliare/case-de-vanzare/sibiu/ (cu phone API)
+  - publi24.ro:    ELIMINAT (SPA, incompatibil cu requests)
 
-Flux:
-1. Scrape imobiliare.ro + publi24.ro + storia.ro + olx.ro (18 localitÄÈi Sibiu)
-2. Upsert TOATE Ã®n Supabase `listings`
-3. Query Supabase: telefon IS NOT NULL AND synced_to_ghl = FALSE
-4. POST la GHL webhook â Agent Ana
-5. MarcheazÄ synced_to_ghl = TRUE Ã®n Supabase
-
-Rezultat: GHL rÄmÃ¢ne curat â doar leads calificaÈi cu numÄr de telefon.
+Flux: Supabase (toate) â GHL (doar cu telefon)
 """
 
-import os
-import re
-import time
-import json
-import hashlib
-import logging
-import requests
+import os, re, sys, time, json, hashlib, logging, requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
-# âââ Logging âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', stream=sys.stdout)
 log = logging.getLogger(__name__)
 
-# âââ Config âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # service_role key (bypass RLS)
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GHL_WEBHOOK_URL = os.environ["GHL_WEBHOOK_URL"]
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "ro-RO,ro;q=0.9,en;q=0.8",
 }
+HEADERS_OLX_API = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.olx.ro/",
+    "Origin": "https://www.olx.ro",
+}
 
-# 18 localitÄÈi Sibiu
 LOCALITATI_SIBIU = [
     "sibiu", "cisnadie", "saliste", "ocna-sibiului",
     "miercurea-sibiului", "avrig", "agnita", "dumbraveni",
-    "copsa-mica", "medias", "talmaciu", "cristian-sb",
+    "copsa-mica", "medias", "talmaciu", "cristian",
     "selimbar", "rasinari", "poplaca", "gura-raului",
     "riu-sadului", "tilisca",
 ]
 
-# âââ Supabase client ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# âââ Helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def generate_id(sursa: str, url: str) -> str:
-    """ID determinist bazat pe sursÄ + URL â previne duplicate."""
+def gen_id(sursa, url):
     return hashlib.sha256(f"{sursa}:{url}".encode()).hexdigest()[:32]
 
+def curata_pret(text):
+    if not text: return None
+    n = re.sub(r"[^\d]", "", text)
+    return float(n) if n else None
 
-def curata_pret(text: str) -> float | None:
-    """Extrage valoarea numericÄ din text preÈ."""
-    if not text:
-        return None
-    numere = re.sub(r"[^\d]", "", text)
-    return float(numere) if numere else None
-
-
-def curata_telefon(text: str) -> str | None:
-    """NormalizeazÄ numÄrul de telefon la format internaÈional."""
-    if not text:
-        return None
+def curata_telefon(text):
+    if not text: return None
     cifre = re.sub(r"[^\d+]", "", text)
-    if len(cifre) < 9:
-        return None
-    # Normalizare: 07xx â +407xx
+    if len(cifre) < 9: return None
     if cifre.startswith("07") or cifre.startswith("02"):
         cifre = "+4" + cifre
     return cifre
 
-
-# âââ Scraper imobiliare.ro ââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def scrape_imobiliare(localitate: str) -> list[dict]:
+# âââ imobiliare.ro ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def scrape_imobiliare(localitate):
     anunturi = []
-    url = f"https://www.imobiliare.ro/vanzare-case-si-vile/{localitate}/?pagina=1"
-
+    url = f"https://www.imobiliare.ro/vanzare-case-vile/judetul-sibiu/{localitate}"
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
+        if r.status_code != 200:
+            log.warning(f"imobiliare.ro/{localitate}: HTTP {r.status_code}")
+            return []
         soup = BeautifulSoup(r.text, "html.parser")
-
-        carduri = soup.select("div.card-v2") or soup.select("article.listing-card")
-        log.info(f"imobiliare.ro/{localitate}: {len(carduri)} carduri gÄsite")
-
-        for card in carduri[:30]:
-            try:
-                link_el = card.select_one("a[href*='/vanzare']") or card.select_one("a.js-item-title")
-                if not link_el:
-                    continue
-
-                url_anunt = link_el.get("href", "")
-                if not url_anunt.startswith("http"):
-                    url_anunt = "https://www.imobiliare.ro" + url_anunt
-
-                titlu_el = card.select_one("h2, h3, .title, .js-item-title")
-                pret_el = card.select_one(".pret, .price, [data-price]")
-                zona_el = card.select_one(".locatie, .location, .address")
-                suprafata_el = card.select_one(".suprafata, [data-surface]")
-
-                # Extrage telefon dacÄ e vizibil pe listing (rar, dar posibil)
-                tel_el = card.select_one("[href^='tel:'], .phone, .telefon")
-                telefon = None
-                if tel_el:
-                    tel_raw = tel_el.get("href", "").replace("tel:", "") or tel_el.text
-                    telefon = curata_telefon(tel_raw)
-
-                anunt = {
-                    "id": generate_id("imobiliare.ro", url_anunt),
-                    "sursa": "imobiliare.ro",
-                    "localitate": localitate,
-                    "titlu": titlu_el.text.strip() if titlu_el else None,
-                    "pret_eur": curata_pret(pret_el.text if pret_el else ""),
-                    "zona": zona_el.text.strip() if zona_el else localitate,
-                    "suprafata_mp": curata_pret(suprafata_el.text if suprafata_el else ""),
-                    "telefon": telefon,
-                    "url_anunt": url_anunt,
-                    "data_scraping": datetime.utcnow().isoformat(),
-                    "synced_to_ghl": False,
-                }
-                anunturi.append(anunt)
-
-            except Exception as e:
-                log.warning(f"Eroare card imobiliare.ro: {e}")
-                continue
-
+        container = soup.find(id="search-listing-results")
+        if not container:
+            log.warning(f"imobiliare.ro/{localitate}: no #search-listing-results")
+            return []
+        links = container.find_all("a", href=re.compile(r"/oferta/"))
+        seen = set()
+        for a in links[:30]:
+            href = a.get("href", "")
+            if not href.startswith("http"):
+                href = "https://www.imobiliare.ro" + href
+            if href in seen: continue
+            seen.add(href)
+            pret_el = a.find_parent().find(class_=re.compile(r"pret|price")) if a.find_parent() else None
+            titlu = a.get_text(strip=True)[:80] or None
+            anunturi.append({
+                "id": gen_id("imobiliare.ro", href),
+                "sursa": "imobiliare.ro",
+                "localitate": localitate,
+                "titlu": titlu,
+                "pret_eur": curata_pret(pret_el.text if pret_el else ""),
+                "zona": localitate,
+                "suprafata_mp": None,
+                "telefon": None,
+                "url_anunt": href,
+                "data_scraping": datetime.utcnow().isoformat(),
+                "synced_to_ghl": False,
+            })
+        log.info(f"imobiliare.ro/{localitate}: {len(anunturi)} anunturi")
     except Exception as e:
-        log.error(f"Eroare imobiliare.ro/{localitate}: {e}")
-
+        log.error(f"imobiliare.ro/{localitate}: {e}")
     return anunturi
 
-
-# âââ Scraper publi24.ro âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def scrape_publi24(localitate: str) -> list[dict]:
+# âââ storia.ro ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def scrape_storia(localitate):
     anunturi = []
-    url = f"https://www.publi24.ro/anunturi/imobiliare/vanzari/case/{localitate}/"
-
+    url = f"https://www.storia.ro/ro/rezultate/vanzare/casa/sibiu/{localitate}"
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
+        if r.status_code != 200:
+            log.warning(f"storia.ro/{localitate}: HTTP {r.status_code}")
+            return []
         soup = BeautifulSoup(r.text, "html.parser")
-
-        carduri = soup.select(".listing-item, .ad-item, article.ad")
-        log.info(f"publi24.ro/{localitate}: {len(carduri)} carduri gÄsite")
-
-        for card in carduri[:30]:
-            try:
-                link_el = card.select_one("a[href]")
-                if not link_el:
-                    continue
-
-                url_anunt = link_el.get("href", "")
-                if not url_anunt.startswith("http"):
-                    url_anunt = "https://www.publi24.ro" + url_anunt
-
-                titlu_el = card.select_one("h2, h3, .title, .ad-title")
-                pret_el = card.select_one(".price, .pret")
-                zona_el = card.select_one(".location, .locatie")
-
-                # publi24 afiÈeazÄ uneori telefon pe listing
-                tel_el = card.select_one("[href^='tel:']")
-                telefon = None
-                if tel_el:
-                    tel_raw = tel_el.get("href", "").replace("tel:", "")
-                    telefon = curata_telefon(tel_raw)
-
-                anunt = {
-                    "id": generate_id("publi24.ro", url_anunt),
-                    "sursa": "publi24.ro",
-                    "localitate": localitate,
-                    "titlu": titlu_el.text.strip() if titlu_el else None,
-                    "pret_eur": curata_pret(pret_el.text if pret_el else ""),
-                    "zona": zona_el.text.strip() if zona_el else localitate,
-                    "suprafata_mp": None,
-                    "telefon": telefon,
-                    "url_anunt": url_anunt,
-                    "data_scraping": datetime.utcnow().isoformat(),
-                    "synced_to_ghl": False,
-                }
-                anunturi.append(anunt)
-
-            except Exception as e:
-                log.warning(f"Eroare card publi24: {e}")
-                continue
-
+        articles = soup.find_all("article")
+        for art in articles[:30]:
+            a = art.find("a", href=True)
+            if not a: continue
+            href = a.get("href", "")
+            if not href.startswith("http"):
+                href = "https://www.storia.ro" + href
+            if "/oferta/" not in href and "/ro/oferta/" not in href: continue
+            titlu = art.find("h3") or art.find("h2")
+            pret_el = art.find(attrs={"data-testid": re.compile(r"price")}) or art.find(class_=re.compile(r"price|pret"))
+            anunturi.append({
+                "id": gen_id("storia.ro", href),
+                "sursa": "storia.ro",
+                "localitate": localitate,
+                "titlu": titlu.get_text(strip=True)[:80] if titlu else None,
+                "pret_eur": curata_pret(pret_el.get_text() if pret_el else ""),
+                "zona": localitate,
+                "suprafata_mp": None,
+                "telefon": None,
+                "url_anunt": href,
+                "data_scraping": datetime.utcnow().isoformat(),
+                "synced_to_ghl": False,
+            })
+        log.info(f"storia.ro/{localitate}: {len(anunturi)} anunturi")
     except Exception as e:
-        log.error(f"Eroare publi24.ro/{localitate}: {e}")
-
+        log.error(f"storia.ro/{localitate}: {e}")
     return anunturi
 
+# âââ olx.ro (cu phone API â dovedit funcÈional Ã®n v8) ââââââââââââââââââââââââ
+def extract_numeric_id(html_text):
+    for pat in [r'"sku"\s*:\s*"([0-9]{6,12})"', r'ad_id=([0-9]{6,12})', r'/offers/([0-9]{6,12})/']:
+        m = re.search(pat, html_text)
+        if m: return m.group(1)
+    return None
 
-# âââ Scraper storia.ro ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def scrape_storia(localitate: str) -> list[dict]:
-    anunturi = []
-    url = f"https://www.storia.ro/vanzare/case/{localitate}/"
-
+def fetch_olx_phone(numeric_id):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        carduri = soup.select("[data-testid='listing-item'], article.css-134la8x, li.css-o9b79t")
-        log.info(f"storia.ro/{localitate}: {len(carduri)} carduri gÄsite")
-
-        for card in carduri[:30]:
-            try:
-                link_el = card.select_one("a[href]")
-                if not link_el:
-                    continue
-
-                url_anunt = link_el.get("href", "")
-                if not url_anunt.startswith("http"):
-                    url_anunt = "https://www.storia.ro" + url_anunt
-
-                titlu_el = card.select_one("h3, [data-testid='listing-item-title']")
-                pret_el = card.select_one("[data-testid='listing-item-price'], .css-1mojccp")
-                zona_el = card.select_one("[data-testid='listing-item-address'], .css-42r2ms")
-
-                anunt = {
-                    "id": generate_id("storia.ro", url_anunt),
-                    "sursa": "storia.ro",
-                    "localitate": localitate,
-                    "titlu": titlu_el.text.strip() if titlu_el else None,
-                    "pret_eur": curata_pret(pret_el.text if pret_el else ""),
-                    "zona": zona_el.text.strip() if zona_el else localitate,
-                    "suprafata_mp": None,
-                    "telefon": None,  # Storia nu afiÈeazÄ telefon pe listing
-                    "url_anunt": url_anunt,
-                    "data_scraping": datetime.utcnow().isoformat(),
-                    "synced_to_ghl": False,
-                }
-                anunturi.append(anunt)
-
-            except Exception as e:
-                log.warning(f"Eroare card storia: {e}")
-                continue
-
+        r = requests.get(
+            f"https://www.olx.ro/api/v1/offers/{numeric_id}/limited-phones/",
+            headers=HEADERS_OLX_API, timeout=15
+        )
+        if r.status_code == 200:
+            phones = r.json().get("data", {}).get("phones", [])
+            if phones:
+                return curata_telefon(phones[0])
     except Exception as e:
-        log.error(f"Eroare storia.ro/{localitate}: {e}")
+        log.warning(f"OLX phone API {numeric_id}: {e}")
+    return None
 
-    return anunturi
-
-
-# âââ Scraper olx.ro âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def scrape_olx(localitate: str) -> list[dict]:
+def scrape_olx():
     anunturi = []
-    # OLX foloseÈte slug-uri diferite
-    slug = localitate.replace("-", "_")
-    url = f"https://www.olx.ro/imobiliare/case-terenuri/vanzare-case/sibiu/{localitate}/"
+    for page in range(1, 6):
+        url = f"https://www.olx.ro/imobiliare/case-de-vanzare/sibiu/?page={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
+            cards = soup.select('[data-cy="l-card"]')
+            log.info(f"olx.ro page {page}: {len(cards)} carduri")
+            if not cards: break
+            for card in cards:
+                a = card.select_one('a[href*="/d/"]')
+                if not a: continue
+                href = a["href"]
+                if not href.startswith("http"):
+                    href = "https://www.olx.ro" + href
+                href = href.split("?")[0]
+                lid = href.rstrip("/").split("/")[-1]
 
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+                titlu_el = card.select_one('[data-cy="ad-card-title"] h6, h6, h4')
+                pret_el = card.select_one('[data-testid="ad-price"]')
+                loc_el = card.select_one('[data-testid="location-date"]')
 
-        carduri = soup.select("[data-cy='l-card'], .css-qo0cxu")
-        log.info(f"olx.ro/{localitate}: {len(carduri)} carduri gÄsite")
+                pret_text = pret_el.get_text(strip=True) if pret_el else ""
+                nums = re.findall(r"[0-9]+", pret_text.replace(".", "").replace(" ", ""))
+                pret_val = float("".join(nums[:2])) if nums else None
+                cur = "RON" if "RON" in pret_text.upper() else "EUR"
+                pret_str = f"{pret_val} {cur}" if pret_val else None
 
-        for card in carduri[:30]:
-            try:
-                link_el = card.select_one("a[href*='/oferta/']")
-                if not link_el:
-                    continue
+                # Fetch phone via API
+                time.sleep(0.5)
+                try:
+                    detail_r = requests.get(href, headers=HEADERS, timeout=20)
+                    numeric_id = extract_numeric_id(detail_r.text)
+                    telefon = fetch_olx_phone(numeric_id) if numeric_id else None
+                except Exception:
+                    telefon = None
 
-                url_anunt = link_el.get("href", "")
-                if not url_anunt.startswith("http"):
-                    url_anunt = "https://www.olx.ro" + url_anunt
-
-                titlu_el = card.select_one("h6, h4, [data-cy='ad-title']")
-                pret_el = card.select_one("[data-testid='ad-price'], .css-tyui9s")
-                zona_el = card.select_one("[data-testid='location-date'], p.css-1a4brun")
-
-                anunt = {
-                    "id": generate_id("olx.ro", url_anunt),
+                anunturi.append({
+                    "id": gen_id("olx.ro", href),
                     "sursa": "olx.ro",
-                    "localitate": localitate,
-                    "titlu": titlu_el.text.strip() if titlu_el else None,
-                    "pret_eur": curata_pret(pret_el.text if pret_el else ""),
-                    "zona": zona_el.text.strip() if zona_el else localitate,
+                    "localitate": "sibiu",
+                    "titlu": titlu_el.get_text(strip=True)[:80] if titlu_el else None,
+                    "pret_eur": pret_val if cur == "EUR" else None,
+                    "zona": loc_el.get_text(strip=True).split(",")[0] if loc_el else "Sibiu",
                     "suprafata_mp": None,
-                    "telefon": None,  # OLX ascunde telefonul dupÄ click
-                    "url_anunt": url_anunt,
+                    "telefon": telefon,
+                    "url_anunt": href,
                     "data_scraping": datetime.utcnow().isoformat(),
                     "synced_to_ghl": False,
-                }
-                anunturi.append(anunt)
-
-            except Exception as e:
-                log.warning(f"Eroare card olx: {e}")
-                continue
-
-    except Exception as e:
-        log.error(f"Eroare olx.ro/{localitate}: {e}")
-
+                })
+                time.sleep(1)
+            time.sleep(3)
+        except Exception as e:
+            log.error(f"olx.ro page {page}: {e}")
+            break
+    log.info(f"olx.ro TOTAL: {len(anunturi)} anunturi")
     return anunturi
 
-
-# âââ Upsert Ã®n Supabase âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def upsert_supabase(anunturi: list[dict]) -> int:
-    """
-    Upsert batch Ã®n Supabase.
-    ON CONFLICT (id) â nu suprascrie synced_to_ghl dacÄ deja e True.
-    ReturneazÄ numÄrul de rÃ¢nduri inserate/actualizate.
-    """
-    if not anunturi:
-        return 0
-
-    try:
-        # Batch de 50 pentru a evita timeout
-        total = 0
-        for i in range(0, len(anunturi), 50):
-            batch = anunturi[i:i+50]
-            result = (
-                supabase.table("listings")
-                .upsert(batch, on_conflict="id", ignore_duplicates=False)
-                .execute()
-            )
+# âââ Supabase upsert ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def upsert_supabase(anunturi):
+    if not anunturi: return 0
+    total = 0
+    for i in range(0, len(anunturi), 50):
+        batch = anunturi[i:i+50]
+        try:
+            supabase.table("listings").upsert(batch, on_conflict="id").execute()
             total += len(batch)
-            log.info(f"Supabase upsert: {len(batch)} rÃ¢nduri (batch {i//50 + 1})")
+            log.info(f"Supabase: batch {i//50+1} â {len(batch)} randuri")
+        except Exception as e:
+            log.error(f"Supabase upsert batch {i//50+1}: {e}")
+    return total
 
-        return total
-
-    except Exception as e:
-        log.error(f"Eroare Supabase upsert: {e}")
-        return 0
-
-
-# âââ Sync la GHL (doar cu telefon, nesincronizate) âââââââââââââââââââââââââââ
-def sync_leads_to_ghl() -> int:
-    """
-    CiteÈte din Supabase DOAR rÃ¢ndurile cu telefon AND synced_to_ghl = FALSE.
-    POST fiecare la GHL webhook.
-    MarcheazÄ synced_to_ghl = TRUE dupÄ trimitere reuÈitÄ.
-    """
+# âââ GHL sync (doar cu telefon) âââââââââââââââââââââââââââââââââââââââââââââââ
+def sync_ghl():
     try:
-        result = (
-            supabase.table("listings")
-            .select("*")
+        result = (supabase.table("listings").select("*")
             .not_.is_("telefon", "null")
             .neq("synced_to_ghl", True)
-            .execute()
-        )
-
+            .execute())
         leads = result.data or []
-        log.info(f"Leads cu telefon de sincronizat: {len(leads)}")
-
-        sincronizate = 0
+        log.info(f"GHL sync: {len(leads)} leads cu telefon")
+        synced = 0
         for lead in leads:
+            payload = {
+                "firstName": (lead.get("titlu") or "Vanzator")[:50],
+                "phone": lead["telefon"],
+                "email": "",
+                "customField": {
+                    "sursa_anunt": lead.get("sursa", ""),
+                    "url_anunt": lead.get("url_anunt", ""),
+                    "localitate": lead.get("localitate", ""),
+                    "pret_eur": str(lead.get("pret_eur") or ""),
+                    "zona": lead.get("zona", ""),
+                },
+                "tags": ["scraper", f"sursa_{lead.get('sursa','').replace('.','_')}"],
+            }
             try:
-                payload = {
-                    # CÃ¢mpuri standard GHL
-                    "firstName": (lead.get("titlu") or "VÃ¢nzÄtor")[:50],
-                    "phone": lead["telefon"],
-                    "email": "",  # nu avem email de pe scraper
-
-                    # Custom fields GHL
-                    "customField": {
-                        "sursa_anunt": lead.get("sursa", ""),
-                        "url_anunt": lead.get("url_anunt", ""),
-                        "localitate": lead.get("localitate", ""),
-                        "pret_eur": str(lead.get("pret_eur") or ""),
-                        "suprafata_mp": str(lead.get("suprafata_mp") or ""),
-                        "zona": lead.get("zona", ""),
-                        "data_anunt": lead.get("data_scraping", ""),
-                        "listing_id": lead.get("id", ""),
-                    },
-
-                    # Tag pentru filtrare Ã®n GHL (nu declanÈeazÄ workflow greÈit)
-                    "tags": ["scraper", f"sursa_{lead.get('sursa','').replace('.', '_')}"],
-                }
-
-                r = requests.post(
-                    GHL_WEBHOOK_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=10,
-                )
-
+                r = requests.post(GHL_WEBHOOK_URL, json=payload,
+                    headers={"Content-Type": "application/json"}, timeout=10)
                 if r.status_code in (200, 201, 202):
-                    # MarcheazÄ ca sincronizat
                     supabase.table("listings").update(
                         {"synced_to_ghl": True, "ghl_sync_at": datetime.utcnow().isoformat()}
                     ).eq("id", lead["id"]).execute()
-
-                    sincronizate += 1
-                    log.info(f"â GHL sync: {lead['telefon']} ({lead.get('sursa')}/{lead.get('localitate')})")
-                else:
-                    log.warning(f"GHL webhook {r.status_code}: {r.text[:100]}")
-
-                # Rate limit: 1 req/secundÄ cÄtre GHL
-                time.sleep(1)
-
+                    synced += 1
+                    log.info(f"â GHL: {lead['telefon']} ({lead.get('sursa')}/{lead.get('localitate')})")
             except Exception as e:
-                log.error(f"Eroare sync lead {lead.get('id')}: {e}")
-                continue
-
-        return sincronizate
-
+                log.error(f"GHL lead {lead.get('id')}: {e}")
+            time.sleep(1)
+        return synced
     except Exception as e:
-        log.error(f"Eroare sync_leads_to_ghl: {e}")
+        log.error(f"sync_ghl: {e}")
         return 0
-
 
 # âââ Main âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def main():
     log.info("=" * 60)
-    log.info("RoImobiliare Scraper v3 â START")
+    log.info("RoImobiliare Scraper v4 â START")
     log.info(f"Timestamp: {datetime.utcnow().isoformat()}")
     log.info("=" * 60)
 
-    toate_anunturile = []
-    stats = {"imobiliare": 0, "publi24": 0, "storia": 0, "olx": 0}
+    toate = []
 
-    for localitate in LOCALITATI_SIBIU:
-        log.info(f"\nâââ Localitate: {localitate.upper()} âââ")
-
-        # imobiliare.ro
-        rez = scrape_imobiliare(localitate)
-        stats["imobiliare"] += len(rez)
-        toate_anunturile.extend(rez)
+    # imobiliare.ro + storia.ro â per localitate
+    for loc in LOCALITATI_SIBIU:
+        log.info(f"\nâââ {loc.upper()} âââ")
+        rez = scrape_imobiliare(loc)
+        toate.extend(rez)
+        time.sleep(2)
+        rez = scrape_storia(loc)
+        toate.extend(rez)
         time.sleep(2)
 
-        # publi24.ro
-        rez = scrape_publi24(localitate)
-        stats["publi24"] += len(rez)
-        toate_anunturile.extend(rez)
-        time.sleep(2)
+    # olx.ro â county level (are phone API)
+    log.info("\nâââ OLX Sibiu âââ")
+    toate.extend(scrape_olx())
 
-        # storia.ro
-        rez = scrape_storia(localitate)
-        stats["storia"] += len(rez)
-        toate_anunturile.extend(rez)
-        time.sleep(2)
+    log.info(f"\nTOTAL scraped: {len(toate)}")
+    cu_tel = len([a for a in toate if a.get("telefon")])
+    log.info(f"Cu telefon: {cu_tel} | Fara telefon: {len(toate)-cu_tel}")
 
-        # olx.ro
-        rez = scrape_olx(localitate)
-        stats["olx"] += len(rez)
-        toate_anunturile.extend(rez)
-        time.sleep(3)
+    saved = upsert_supabase(toate)
+    log.info(f"Supabase: {saved} randuri salvate")
+
+    synced = sync_ghl()
+    log.info(f"GHL: {synced} leads trimise")
 
     log.info("\n" + "=" * 60)
-    log.info(f"TOTAL anunÈuri scraped: {len(toate_anunturile)}")
-    log.info(f"  imobiliare.ro: {stats['imobiliare']}")
-    log.info(f"  publi24.ro:    {stats['publi24']}")
-    log.info(f"  storia.ro:     {stats['storia']}")
-    log.info(f"  olx.ro:        {stats['olx']}")
-
-    # PASUL 1: SalveazÄ TOTUL Ã®n Supabase
-    log.info("\nâââ SUPABASE UPSERT âââ")
-    total_saved = upsert_supabase(toate_anunturile)
-    log.info(f"Supabase: {total_saved} rÃ¢nduri salvate")
-
-    # PASUL 2: SincronizeazÄ DOAR leads cu telefon la GHL
-    log.info("\nâââ GHL SYNC (doar cu telefon) âââ")
-    total_ghl = sync_leads_to_ghl()
-    log.info(f"GHL: {total_ghl} leads trimise")
-
-    # Statistici finale
-    cu_telefon = len([a for a in toate_anunturile if a.get("telefon")])
-    log.info("\n" + "=" * 60)
-    log.info(f"SUMMARY:")
-    log.info(f"  Total anunÈuri â Supabase: {len(toate_anunturile)}")
-    log.info(f"  AnunÈuri cu telefon:       {cu_telefon}")
-    log.info(f"  Leads trimise â GHL:       {total_ghl}")
-    log.info(f"  FÄrÄ telefon (Ã®n Supabase, nu Ã®n GHL): {len(toate_anunturile) - cu_telefon}")
+    log.info("SUMMARY:")
+    log.info(f"  Total â Supabase: {len(toate)}")
+    log.info(f"  Cu telefon â GHL: {synced}")
+    log.info(f"  Fara telefon (arhiva): {len(toate) - cu_tel}")
     log.info("=" * 60)
-    log.info("Scraper v3 â DONE")
-
+    log.info("Scraper v4 â DONE")
 
 if __name__ == "__main__":
     main()
