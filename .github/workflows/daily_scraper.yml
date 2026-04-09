@@ -1,52 +1,24 @@
-name: RoImobiliare Daily Scraper v3
+name: RoImobiliare Scraper
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Mod rulare"
-        required: false
-        default: "full"
-        type: choice
-        options:
-          - full
-          - sync_only
-          - sibiu_only
 
 jobs:
-  scraper:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GHL_WEBHOOK_URL: ${{ secrets.GHL_WEBHOOK_URL }}
-          SCRAPE_MODE: ${{ github.event.inputs.mode || 'full' }}
-        run: |
-          echo "Mod: $SCRAPE_MODE"
-          python scraper.py
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraper-logs-${{ github.run_number }}
-          path: "*.log"
-          retention-days: 7
+        run: python scraper.py
