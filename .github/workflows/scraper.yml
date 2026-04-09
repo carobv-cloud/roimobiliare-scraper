@@ -18,5 +18,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run scraper
         env:
-          GHL_API_KEY: ${{ secrets.GHL_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GHL_WEBHOOK_URL: ${{ secrets.GHL_WEBHOOK_URL }}
         run: python scraper.py
