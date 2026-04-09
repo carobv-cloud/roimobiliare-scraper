@@ -21,4 +21,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GHL_WEBHOOK_URL: ${{ secrets.GHL_WEBHOOK_URL }}
+          GHL_PRIVATE_TOKEN: ${{ secrets.GHL_PRIVATE_TOKEN }}
         run: python scraper.py
